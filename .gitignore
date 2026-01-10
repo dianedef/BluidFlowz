@@ -1,0 +1,12 @@
+# Temp files
+*.tmp
+/tmp/
+
+# PM2 configs
+pm2-*.json
+
+# Logs
+*.log
+
+# Crush cache
+.crush/

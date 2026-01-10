@@ -1,0 +1,494 @@
+#!/bin/bash
+
+# Shared library for Dokploy CLI
+# Contains all reusable functions and logic
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+NC='\033[0m'
+
+# Config
+PROJECTS_DIR="/root"
+
+# Helper functions
+success() {
+    echo -e "${GREEN}✅${NC} $1"
+}
+
+error() {
+    echo -e "${RED}❌${NC} $1"
+}
+
+info() {
+    echo -e "${BLUE}ℹ️${NC} $1"
+}
+
+warning() {
+    echo -e "${YELLOW}⚠️${NC} $1"
+}
+
+# Port management
+is_port_in_use() {
+    local port=$1
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -E "[:.]${port}$" >/dev/null 2>&1
+}
+
+find_available_port() {
+    local base_port=$1
+    local max_range=100
+    local port=$base_port
+    
+    while [ $((port - base_port)) -lt $max_range ]; do
+        if ! is_port_in_use $port; then
+            echo $port
+            return 0
+        fi
+        port=$((port + 1))
+    done
+    
+    echo -e "${RED}❌ Impossible de trouver un port disponible après $max_range tentatives${NC}" >&2
+    return 1
+}
+
+# Get project status from PM2
+get_pm2_status() {
+    local env_name=$1
+    
+    if ! command -v pm2 >/dev/null 2>&1; then
+        echo "pm2-not-installed"
+        return 1
+    fi
+    
+    # Vérifie si le projet existe dans PM2
+    if pm2 jlist 2>/dev/null | grep -q "\"name\":\"$env_name\""; then
+        # Récupère le statut
+        local status=$(pm2 jlist 2>/dev/null | python3 -c "import sys, json; apps = json.load(sys.stdin); print([a['pm2_env']['status'] for a in apps if a['name'] == '$env_name'][0] if any(a['name'] == '$env_name' for a in apps) else 'unknown')" 2>/dev/null)
+        echo "${status:-unknown}"
+        return 0
+    else
+        echo "stopped"
+        return 0
+    fi
+}
+
+# Get project directory path
+get_project_dir() {
+    local env_name=$1
+    local project_dir="$PROJECTS_DIR/$env_name"
+    
+    if [ -d "$project_dir" ]; then
+        echo "$project_dir"
+        return 0
+    fi
+    
+    return 1
+}
+
+# Get port from PM2 env vars for a project
+get_port_from_pm2() {
+    local env_name=$1
+    
+    if ! command -v pm2 >/dev/null 2>&1; then
+        return 1
+    fi
+    
+    pm2 jlist 2>/dev/null | python3 -c "
+import sys, json
+try:
+    apps = json.load(sys.stdin)
+    for app in apps:
+        if app['name'] == '$env_name':
+            env_vars = app.get('pm2_env', {}).get('env', {})
+            port = env_vars.get('PORT', '')
+            if port:
+                print(port)
+                sys.exit(0)
+except:
+    pass
+" 2>/dev/null
+}
+
+# List all environments (projects with Flox env)
+list_all_environments() {
+    if [ -d "$PROJECTS_DIR" ]; then
+        find "$PROJECTS_DIR" -maxdepth 2 -type d -name ".flox" 2>/dev/null | while read -r flox_dir; do
+            basename "$(dirname "$flox_dir")"
+        done | grep -v "^\.$" | sort
+    fi
+}
+
+# Cleanup orphan projects
+cleanup_orphan_projects() {
+    echo -e "${YELLOW}🔍 Recherche de projets orphelins...${NC}"
+    
+    if [ -d "$PROJECTS_DIR" ]; then
+        find "$PROJECTS_DIR" -maxdepth 1 -type d ! -path "$PROJECTS_DIR" | while read -r dir; do
+            if [ ! -d "$dir/.flox" ]; then
+                project_name=$(basename "$dir")
+                echo -e "${YELLOW}🗑️  Projet sans Flox détecté: $project_name${NC}"
+                echo -e "${YELLOW}   (pas d'environnement Flox)${NC}"
+            fi
+        done
+    fi
+    
+    echo -e "${GREEN}✅ Nettoyage terminé${NC}"
+}
+
+# GitHub repo operations
+list_github_repos() {
+    if ! command -v gh >/dev/null 2>&1; then
+        error "GitHub CLI (gh) n'est pas installé"
+        echo -e "${YELLOW}Installation :${NC} apt install gh"
+        return 1
+    fi
+    
+    if ! gh auth status >/dev/null 2>&1; then
+        error "Non authentifié sur GitHub"
+        echo -e "${YELLOW}Authentification :${NC} gh auth login"
+        return 1
+    fi
+    
+    gh repo list --limit 20 --json name,description --jq '.[] | "\(.name): \(.description)"' 2>/dev/null
+}
+
+get_github_username() {
+    gh api user --jq .login 2>/dev/null
+}
+
+# Detect project type and return package manager info
+detect_project_type() {
+    local project_dir=$1
+    
+    cd "$project_dir" || return 1
+    
+    if [ -f "package-lock.json" ]; then
+        echo "nodejs:npm"
+    elif [ -f "pnpm-lock.yaml" ]; then
+        echo "nodejs:pnpm"
+    elif [ -f "yarn.lock" ]; then
+        echo "nodejs:yarn"
+    elif [ -f "package.json" ]; then
+        echo "nodejs:npm"
+    elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
+        echo "python:pip"
+    elif [ -f "Cargo.toml" ]; then
+        echo "rust:cargo"
+    elif [ -f "go.mod" ]; then
+        echo "go:go"
+    else
+        echo "generic:none"
+    fi
+}
+
+# Create or init Flox environment for project
+init_flox_env() {
+    local project_dir=$1
+    local project_name=$2
+    
+    cd "$project_dir" || return 1
+    
+    if [ -d ".flox" ]; then
+        echo -e "${GREEN}✅ Environnement Flox existe déjà${NC}"
+        return 0
+    fi
+    
+    echo -e "${BLUE}🔧 Création de l'environnement Flox...${NC}"
+    
+    # Detect project type
+    local project_type=$(detect_project_type "$project_dir")
+    local lang=$(echo "$project_type" | cut -d: -f1)
+    local pm=$(echo "$project_type" | cut -d: -f2)
+    
+    echo -e "${BLUE}📦 Type détecté: $lang ($pm)${NC}"
+    
+    # Init flox environment
+    if ! flox init -d "$project_dir" 2>/dev/null; then
+        error "Échec de l'initialisation Flox"
+        return 1
+    fi
+    
+    # Install packages based on project type
+    case "$lang" in
+        nodejs)
+            echo -e "${BLUE}📦 Installation de Node.js...${NC}"
+            flox install nodejs 2>&1 | tail -1
+            # Install package manager if needed
+            if [ "$pm" = "pnpm" ]; then
+                echo -e "${BLUE}📦 Installation de pnpm...${NC}"
+                flox install pnpm 2>&1 | tail -1
+            elif [ "$pm" = "yarn" ]; then
+                echo -e "${BLUE}📦 Installation de yarn...${NC}"
+                flox install yarn 2>&1 | tail -1
+            fi
+            ;;
+        python)
+            echo -e "${BLUE}🐍 Installation de Python et pip...${NC}"
+            flox install python3 python3Packages.pip
+            ;;
+        rust)
+            echo -e "${BLUE}🦀 Installation de Rust...${NC}"
+            flox install rustc cargo
+            ;;
+        go)
+            echo -e "${BLUE}🐹 Installation de Go...${NC}"
+            flox install go
+            ;;
+        generic)
+            echo -e "${YELLOW}📄 Projet générique - environnement Flox de base${NC}"
+            ;;
+    esac
+    
+    # Install project dependencies if needed
+    if [ "$lang" = "nodejs" ]; then
+        echo -e "${BLUE}📦 Installation des dépendances du projet...${NC}"
+        cd "$project_dir"
+        if [ "$pm" = "pnpm" ] && [ -f "pnpm-lock.yaml" ]; then
+            flox activate -- pnpm install 2>&1 | grep -v "Progress:" || true
+        elif [ "$pm" = "yarn" ] && [ -f "yarn.lock" ]; then
+            flox activate -- yarn install 2>&1 | grep -v "Progress:" || true
+        elif [ -f "package.json" ]; then
+            flox activate -- npm install 2>&1 | grep -v "npm WARN" || true
+        fi
+        echo -e "${GREEN}✅ Dépendances installées${NC}"
+    fi
+    
+    # Fix port configuration in project files
+    fix_port_config "$project_dir"
+        
+    success "Environnement Flox créé pour $project_name"
+    return 0
+}
+
+# Fix port configuration in project config files
+fix_port_config() {
+    local project_dir=$1
+    
+    cd "$project_dir" || return 1
+    
+    # Astro: astro.config.mjs or astro.config.ts
+    if [ -f "astro.config.mjs" ] || [ -f "astro.config.ts" ]; then
+        local config_file=""
+        [ -f "astro.config.mjs" ] && config_file="astro.config.mjs"
+        [ -f "astro.config.ts" ] && config_file="astro.config.ts"
+        
+        if [ -n "$config_file" ]; then
+            echo -e "${BLUE}🔧 Configuration d'Astro pour utiliser PORT...${NC}"
+            
+            # Check if server config exists with hardcoded port
+            if grep -q "server.*:.*{" "$config_file" && grep -q "port.*:.*[0-9]" "$config_file"; then
+                # Replace hardcoded port with process.env.PORT or default
+                sed -i 's/port: *[0-9]\+/port: parseInt(process.env.PORT) || 3000/' "$config_file"
+                echo -e "${GREEN}✅ Configuration Astro mise à jour${NC}"
+            elif ! grep -q "server.*:" "$config_file"; then
+                # Add server config if not exists
+                sed -i '/export default defineConfig({/a\  server: {\n    port: parseInt(process.env.PORT) || 3000\n  },' "$config_file"
+                echo -e "${GREEN}✅ Configuration Astro ajoutée${NC}"
+            fi
+        fi
+    fi
+    
+    # Next.js: next.config.js or next.config.mjs
+    if [ -f "next.config.js" ] || [ -f "next.config.mjs" ]; then
+        echo -e "${BLUE}ℹ️  Next.js utilise -p pour le port (déjà géré)${NC}"
+    fi
+    
+    # Vite: vite.config.js/ts
+    if [ -f "vite.config.js" ] || [ -f "vite.config.ts" ]; then
+        local config_file=""
+        [ -f "vite.config.js" ] && config_file="vite.config.js"
+        [ -f "vite.config.ts" ] && config_file="vite.config.ts"
+        
+        if [ -n "$config_file" ]; then
+            echo -e "${BLUE}🔧 Configuration de Vite pour utiliser PORT...${NC}"
+            
+            if grep -q "server.*:.*{" "$config_file" && grep -q "port.*:.*[0-9]" "$config_file"; then
+                sed -i 's/port: *[0-9]\+/port: parseInt(process.env.PORT) || 3000/' "$config_file"
+                echo -e "${GREEN}✅ Configuration Vite mise à jour${NC}"
+            elif ! grep -q "server.*:" "$config_file"; then
+                sed -i '/export default defineConfig({/a\  server: {\n    port: parseInt(process.env.PORT) || 3000\n  },' "$config_file"
+                echo -e "${GREEN}✅ Configuration Vite ajoutée${NC}"
+            fi
+        fi
+    fi
+    
+    # Nuxt: nuxt.config.ts
+    if [ -f "nuxt.config.ts" ]; then
+        echo -e "${BLUE}ℹ️  Nuxt utilise --port pour le port (déjà géré)${NC}"
+    fi
+}
+
+# Detect dev command for project
+detect_dev_command() {
+    local project_dir=$1
+    local port=$2  # Port à utiliser
+    
+    cd "$project_dir" || return 1
+    
+    if [ -f "package.json" ]; then
+        # Detect framework from package.json
+        local framework=""
+        if grep -q '"astro"' package.json; then
+            framework="astro"
+        elif grep -q '"next"' package.json; then
+            framework="next"
+        elif grep -q '"vite"' package.json; then
+            framework="vite"
+        elif grep -q '"nuxt"' package.json; then
+            framework="nuxt"
+        fi
+        
+        # Determine package manager
+        local pm_cmd=""
+        if [ -f "pnpm-lock.yaml" ]; then
+            pm_cmd="pnpm"
+        elif [ -f "yarn.lock" ]; then
+            pm_cmd="yarn"
+        else
+            pm_cmd="npm run"
+        fi
+        
+        # Build command based on framework and port
+        if [ -n "$framework" ]; then
+            case "$framework" in
+                astro)
+                    echo "$pm_cmd dev -- --port \$PORT"
+                    ;;
+                next)
+                    echo "$pm_cmd dev -p \$PORT"
+                    ;;
+                vite)
+                    echo "$pm_cmd dev -- --port \$PORT"
+                    ;;
+                nuxt)
+                    echo "$pm_cmd dev --port \$PORT"
+                    ;;
+                *)
+                    echo "$pm_cmd dev"
+                    ;;
+            esac
+        elif grep -q '"dev"' package.json; then
+            echo "$pm_cmd dev"
+        elif grep -q '"start"' package.json; then
+            echo "$pm_cmd start"
+        fi
+    elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
+        if [ -f "manage.py" ]; then
+            echo "python manage.py runserver 0.0.0.0:\$PORT"
+        elif [ -f "app.py" ]; then
+            echo "python app.py"
+        else
+            echo "python -m http.server \$PORT"
+        fi
+    elif [ -f "Cargo.toml" ]; then
+        echo "cargo run"
+    elif [ -f "go.mod" ]; then
+        echo "go run ."
+    else
+        echo "echo 'No dev command detected'"
+    fi
+}
+
+# Environment lifecycle operations with Flox + PM2
+env_start() {
+    local env_name=$1
+    local project_dir="$PROJECTS_DIR/$env_name"
+    
+    if [ ! -d "$project_dir" ]; then
+        error "Projet $env_name introuvable dans $PROJECTS_DIR"
+        return 1
+    fi
+    
+    # Check if Flox env exists, create if not
+    if [ ! -d "$project_dir/.flox" ]; then
+        echo -e "${YELLOW}⚠️  Pas d'environnement Flox détecté${NC}"
+        init_flox_env "$project_dir" "$env_name" || return 1
+    fi
+    
+    # Detect dev command
+    local dev_cmd=$(detect_dev_command "$project_dir")
+    
+    if [ -z "$dev_cmd" ] || [ "$dev_cmd" = "echo 'No dev command detected'" ]; then
+        warning "Aucune commande de dev détectée pour $env_name"
+        return 1
+    fi
+    
+    # Find available port
+    local port=$(find_available_port 3000)
+    [ -z "$port" ] && return 1
+    
+    echo -e "${BLUE}🔌 Port assigné: $port${NC}"
+    echo -e "${BLUE}🚀 Commande: $dev_cmd${NC}"
+    
+    # Start with PM2 using Flox activation
+    # Create temporary PM2 ecosystem file
+    local pm2_config="/tmp/pm2-${env_name}.json"
+    
+    # Replace $PORT in dev_cmd with actual port value
+    local final_cmd="${dev_cmd//\$PORT/$port}"
+    
+    cat > "$pm2_config" <<EOF
+{
+  "apps": [{
+    "name": "$env_name",
+    "cwd": "$project_dir",
+    "script": "bash",
+    "args": ["-c", "export PORT=$port && flox activate -- $final_cmd"],
+    "env": {
+      "PORT": "$port"
+    },
+    "autorestart": true,
+    "watch": false
+  }]
+}
+EOF
+    
+    if pm2 list | grep -q "│ $env_name"; then
+        echo -e "${YELLOW}⚠️  Projet déjà en cours d'exécution, redémarrage...${NC}"
+        pm2 delete "$env_name" >/dev/null 2>&1
+    fi
+    
+    pm2 start "$pm2_config"
+    rm -f "$pm2_config"
+    pm2 save >/dev/null 2>&1
+    success "Projet $env_name démarré sur le port $port"
+}
+
+env_stop() {
+    local env_name=$1
+    
+    if ! pm2 list | grep -q "│ $env_name"; then
+        warning "Projet $env_name n'est pas en cours d'exécution"
+        return 0
+    fi
+    
+    pm2 stop "$env_name" >/dev/null 2>&1
+    pm2 save >/dev/null 2>&1
+    success "Projet $env_name arrêté"
+}
+
+env_remove() {
+    local env_name=$1
+    local project_dir="$PROJECTS_DIR/$env_name"
+    
+    # Stop PM2 process if running
+    if pm2 list | grep -q "│ $env_name"; then
+        echo -e "${YELLOW}🛑 Arrêt du processus PM2...${NC}"
+        pm2 delete "$env_name" >/dev/null 2>&1
+        pm2 save >/dev/null 2>&1
+    fi
+    
+    # Remove project directory
+    if [ -d "$project_dir" ]; then
+        rm -rf "$project_dir"
+        success "Projet $env_name supprimé"
+    else
+        warning "Répertoire $project_dir introuvable"
+    fi
+}
+
+
