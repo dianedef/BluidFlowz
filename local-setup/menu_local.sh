@@ -101,6 +101,9 @@ start_tunnels() {
     done <<< "$PORTS"
     
     echo ""
+    echo -e "${YELLOW}⏳ Attente de l'établissement des tunnels...${NC}"
+    sleep 3
+    
     echo -e "${GREEN}✅ Tunnels actifs !${NC}"
 }
 
@@ -120,9 +123,16 @@ show_urls() {
         port=$(echo "$line" | cut -d':' -f1)
         name=$(echo "$line" | cut -d':' -f2)
         
-        # Vérifier si le tunnel est actif
-        if ps aux | grep -q "[a]utossh.*:${port}:localhost:${port}"; then
-            echo -e "  ${GREEN}✓${NC} http://localhost:${port} ${YELLOW}(${name})${NC}"
+        # Vérifier si le tunnel est actif (chercher le processus autossh avec le port)
+        if pgrep -f "autossh.*-L ${port}:localhost:${port}" > /dev/null 2>&1; then
+            # Vérifier aussi si le port local est en écoute
+            if command -v lsof &> /dev/null && lsof -i :${port} &> /dev/null; then
+                echo -e "  ${GREEN}✓${NC} http://localhost:${port} ${YELLOW}(${name})${NC} ${GREEN}[actif]${NC}"
+            elif command -v netstat &> /dev/null && netstat -an | grep -q ":${port}.*LISTEN"; then
+                echo -e "  ${GREEN}✓${NC} http://localhost:${port} ${YELLOW}(${name})${NC} ${GREEN}[actif]${NC}"
+            else
+                echo -e "  ${YELLOW}⏳${NC} http://localhost:${port} ${YELLOW}(${name})${NC} ${YELLOW}[en cours]${NC}"
+            fi
         else
             echo -e "  ${RED}✗${NC} http://localhost:${port} ${YELLOW}(${name})${NC} ${RED}[tunnel inactif]${NC}"
         fi
