@@ -65,6 +65,10 @@ Quand vous démarrez un nouveau projet, BuildFlowz :
 
 3. **Crée l'ecosystem.config.cjs** avec le port trouvé
 
+### Persistance des ports
+
+Une fois qu'un port est assigné à un projet (soit manuellement, soit via l'allocation automatique), BuildFlowz le réutilisera pour ce projet lors des démarrages futurs. Le port est stocké dans le fichier `ecosystem.config.cjs` du projet.
+
 ### Sécurité anti-collision
 
 ✅ **Scénario 1** : Port actif (serveur running)  

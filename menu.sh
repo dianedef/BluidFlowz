@@ -25,7 +25,9 @@ main() {
             "BuildFlowz" "Menu Interactif avec Gum"
 
         # Menu de sélection
-        CHOICE=$(gum choose "📁 Naviguer dans /root" "📋 Lister les environnements" "🌐 Afficher les URLs" "🛑 Stopper un environnement" "📝 Ouvrir le répertoire de code" "🚀 Déployer un repo GitHub" "🗑️ Supprimer un environnement" "🚀 Démarrer un environnement" "🌐 Publier sur le web" "👋 Quitter")
+        CHOICE=$(gum choose "📁 Naviguer dans /root" "📋 Lister les environnements" "🌐 Afficher les URLs" "🛑 Stopper un environnement" "📝 Ouvrir le répertoire de code" "🚀 Déployer un repo GitHub" "🗑️ Supprimer un environnement"             "🚀 Démarrer un environnement" \
+            "🚀 Démarrer un environnement (custom path)" \
+            "🌐 Publier sur le web" "👋 Quitter")
 
         case $CHOICE in
             "📁 Naviguer dans /root")
@@ -63,7 +65,7 @@ main() {
                     echo ""
                     while IFS= read -r name; do
                         pm2_status=$(get_pm2_status "$name")
-                        project_dir=$(get_project_dir "$name")
+                        project_dir=$(resolve_project_path "$name")
                         
                         # Afficher le statut avec gum style
                         case "$pm2_status" in
@@ -311,33 +313,59 @@ main() {
                     SELECTED_ENV=$(echo "$ALL_ENVS" | gum filter --placeholder "Rechercher un environnement...")
                     
                     if [ -n "$SELECTED_ENV" ]; then
-                        PROJECT_DIR=$(get_project_dir "$SELECTED_ENV")
+                        gum spin --spinner dot --title "Démarrage de $SELECTED_ENV..." -- env_start "$SELECTED_ENV"
                         
-                        if [ -z "$PROJECT_DIR" ]; then
-                            gum style --foreground 196 "❌ Projet introuvable: $SELECTED_ENV"
+                        echo ""
+                        gum style --foreground 82 "✅ Projet démarré avec succès ou mis à jour !"
+                        
+                        PROJECT_DIR=$(resolve_project_path "$SELECTED_ENV")
+                        ENV_NAME=$(basename "$PROJECT_DIR") # Assuming project name is the last part of the path for PM2
+                        
+                        PORT=$(get_port_from_pm2 "$ENV_NAME")
+                        if [ -n "$PORT" ]; then
+                            echo ""
+                            gum style --foreground 45 "🌐 URL: http://localhost:${PORT}"
+                            gum style --foreground 226 "📝 Code dans: $PROJECT_DIR"
                         else
                             echo ""
-                            gum spin --spinner dot --title "Démarrage de $SELECTED_ENV..." -- env_start "$SELECTED_ENV"
-                            
-                            echo ""
-                            gum style --foreground 82 "✅ Projet démarré avec succès !"
-                            
-                            PORT=$(get_port_from_pm2 "$SELECTED_ENV")
-                            if [ -n "$PORT" ]; then
-                                echo ""
-                                gum style --foreground 45 "🌐 URL: http://localhost:${PORT}"
-                            else
-                                echo ""
-                                gum style --foreground 226 "⚠️  Port non assigné"
-                            fi
-                            
-                            echo ""
+                            gum style --foreground 226 "⚠️  Port non assigné ou non détecté"
                             gum style --foreground 226 "📝 Code dans: $PROJECT_DIR"
                         fi
                     fi
                 fi
                 ;;
-            "🌐 Publier sur le web")
+            "🚀 Démarrer un environnement (custom path)")
+                gum style \
+                    --foreground 82 --border-foreground 82 --border rounded \
+                    --align center --width 50 --padding "0 2" \
+                    "Démarrer un environnement (custom path)"
+                echo ""
+                CUSTOM_PATH=$(gum input --placeholder "Entrez le chemin absolu du projet (ex: /root/my-robots/chatbot)")
+                if [ -z "$CUSTOM_PATH" ]; then
+                    gum style --foreground 196 "❌ Chemin requis"
+                else
+                    gum spin --spinner dot --title "Démarrage du projet à partir de $CUSTOM_PATH..." -- env_start "$CUSTOM_PATH"
+                    echo ""
+                    gum style --foreground 82 "✅ Projet démarré avec succès ou mis à jour !"
+                    
+                    PROJECT_DIR=$(resolve_project_path "$CUSTOM_PATH")
+                    if [ -n "$PROJECT_DIR" ]; then
+                        ENV_NAME=$(basename "$PROJECT_DIR") # This assumes project name is the last part of the path
+                        PORT=$(get_port_from_pm2 "$ENV_NAME")
+                        if [ -n "$PORT" ]; then
+                            echo ""
+                            gum style --foreground 45 "🌐 URL: http://localhost:${PORT}"
+                        else
+                            echo ""
+                            gum style --foreground 226 "⚠️  Port non assigné ou non détecté"
+                        fi
+                        echo ""
+                        gum style --foreground 226 "📝 Code dans: $PROJECT_DIR"
+                    else
+                        gum style --foreground 196 "❌ Impossible de résoudre le répertoire du projet pour $CUSTOM_PATH"
+                    fi
+                fi
+                ;;
                 gum style \
                     --foreground 45 --border-foreground 45 --border rounded \
                     --align center --width 50 --padding "0 2" \

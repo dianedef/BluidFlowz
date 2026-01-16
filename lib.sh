@@ -83,7 +83,15 @@ find_available_port() {
 
 # Get project status from PM2
 get_pm2_status() {
-    local env_name=$1
+    local identifier=$1
+    local project_dir=$(resolve_project_path "$identifier")
+    
+    if [ -z "$project_dir" ]; then
+        echo "not-found"
+        return 1
+    fi
+
+    local env_name=$(basename "$project_dir") # Use basename as the PM2 app name
     
     if ! command -v pm2 >/dev/null 2>&1; then
         echo "pm2-not-installed"
@@ -103,21 +111,18 @@ get_pm2_status() {
 }
 
 # Get project directory path
-get_project_dir() {
-    local env_name=$1
-    local project_dir="$PROJECTS_DIR/$env_name"
-    
-    if [ -d "$project_dir" ]; then
-        echo "$project_dir"
-        return 0
-    fi
-    
-    return 1
-}
+
 
 # Get port from PM2 env vars for a project
 get_port_from_pm2() {
-    local env_name=$1
+    local identifier=$1
+    local project_dir=$(resolve_project_path "$identifier")
+
+    if [ -z "$project_dir" ]; then
+        return 1
+    fi
+
+    local env_name=$(basename "$project_dir") # Use basename as the PM2 app name
     
     if ! command -v pm2 >/dev/null 2>&1; then
         return 1
@@ -139,14 +144,54 @@ except:
 " 2>/dev/null
 }
 
+
+# Resolve project path from an identifier (env_name or full_path)
+resolve_project_path() {
+    local identifier=$1
+
+    # Case 1: Identifier is already an absolute path
+    if [[ "$identifier" == /* && -d "$identifier" && -d "$identifier/.flox" ]]; then
+        echo "$identifier"
+        return 0
+    fi
+
+    # Case 2: Identifier is an environment name, search within PROJECTS_DIR
+    local found_path
+    found_path=$(find "$PROJECTS_DIR" -maxdepth 3 -type d -name "$identifier" 2>/dev/null | while read -r project_dir; do
+        if [ -d "$project_dir/.flox" ]; then
+            echo "$project_dir"
+            exit 0
+        fi
+    done)
+
+    if [ -n "$found_path" ]; then
+        echo "$found_path"
+        return 0
+    fi
+    
+    return 1 # Project not found
+}
+
 # List all environments (projects with Flox env)
 list_all_environments() {
     if [ -d "$PROJECTS_DIR" ]; then
-        find "$PROJECTS_DIR" -maxdepth 2 -type d -name ".flox" 2>/dev/null | while read -r flox_dir; do
-            basename "$(dirname "$flox_dir")"
+        find "$PROJECTS_DIR" -maxdepth 3 -type d -name ".flox" 2>/dev/null | while read -r flox_dir; do
+            # Extract the project name from the path, e.g., /root/my-robots/chatbot/.flox -> chatbot
+            echo "$(basename "$(dirname "$flox_dir")")"
         done | grep -v "^\.$" | sort
     fi
 }
+
+# List all environment identifiers (for menu selection)
+list_all_environment_identifiers() {
+    list_all_environments
+    # Add any other known project paths that might not be detected by list_all_environments but exist
+    # For example, if you want to explicitly add /root/my-robots/chatbot as an option
+    if [ -d "/root/my-robots/chatbot/.flox" ]; then
+        echo "/root/my-robots/chatbot"
+    fi
+}
+
 
 # Cleanup orphan projects
 cleanup_orphan_projects() {
@@ -421,20 +466,26 @@ detect_dev_command() {
 
 # Environment lifecycle operations with Flox + PM2
 env_start() {
-    local env_name=$1
-    local project_dir="$PROJECTS_DIR/$env_name"
-    
-    if [ ! -d "$project_dir" ]; then
-        error "Projet $env_name introuvable dans $PROJECTS_DIR"
+    local identifier=$1 # Can be env_name or custom_path
+    local project_dir=""
+    local env_name=""
+    local pm2_config=""
+
+    project_dir=$(resolve_project_path "$identifier")
+    if [ -z "$project_dir" ]; then
+        error "Projet introuvable pour l'identifiant: $identifier"
         return 1
     fi
     
+    env_name=$(basename "$project_dir") # Derive env_name from the resolved path
+    pm2_config="$project_dir/ecosystem.config.cjs"
+
     # Check if Flox env exists, create if not
     if [ ! -d "$project_dir/.flox" ]; then
         echo -e "${YELLOW}⚠️  Pas d'environnement Flox détecté${NC}"
         init_flox_env "$project_dir" "$env_name" || return 1
     fi
-    
+
     # Detect dev command
     local dev_cmd=$(detect_dev_command "$project_dir")
     
@@ -442,17 +493,23 @@ env_start() {
         warning "Aucune commande de dev détectée pour $env_name"
         return 1
     fi
+
+    local port=""
+    # Check for existing port in ecosystem.config.cjs
+    if [ -f "$pm2_config" ]; then
+        port=$(cat "$pm2_config" | grep -oP 'PORT: \K[0-9]+' | head -1)
+    fi
+
+    # If no persistent port found, find an available one
+    if [ -z "$port" ]; then
+        port=$(find_available_port 3000)
+        [ -z "$port" ] && return 1
+        echo -e "${BLUE}🔌 Nouveau port assigné: $port${NC}"
+    else
+        echo -e "${BLUE}🔌 Port persistant réutilisé: $port${NC}"
+    fi
     
-    # Find available port
-    local port=$(find_available_port 3000)
-    [ -z "$port" ] && return 1
-    
-    echo -e "${BLUE}🔌 Port assigné: $port${NC}"
     echo -e "${BLUE}🚀 Commande: $dev_cmd${NC}"
-    
-    # Start with PM2 using Flox activation
-    # Create persistent PM2 ecosystem file in project directory
-    local pm2_config="$project_dir/ecosystem.config.cjs"
     
     # Replace $PORT in dev_cmd with actual port value
     local final_cmd="${dev_cmd//\$PORT/$port}"
@@ -474,7 +531,7 @@ module.exports = {
 };
 EOF
     
-    echo -e "${GREEN}✅ Fichier ecosystem.config.cjs créé${NC}"
+    echo -e "${GREEN}✅ Fichier ecosystem.config.cjs créé/mis à jour${NC}"
     
     if pm2 list | grep -q "│ $env_name"; then
         echo -e "${YELLOW}⚠️  Projet déjà en cours d'exécution, redémarrage...${NC}"
@@ -487,25 +544,41 @@ EOF
 }
 
 env_stop() {
-    local env_name=$1
+    local identifier=$1
+    local project_dir=$(resolve_project_path "$identifier")
     
-    if ! pm2 list | grep -q "│ $env_name"; then
-        warning "Projet $env_name n'est pas en cours d'exécution"
+    if [ -z "$project_dir" ]; then
+        warning "Projet $identifier introuvable ou chemin invalide."
+        return 1
+    fi
+
+    # Ensure env_name is correctly derived for PM2 operations if a custom path was passed
+    local pm2_app_name=$(basename "$project_dir") 
+
+    if ! pm2 list | grep -q "│ $pm2_app_name"; then
+        warning "Projet $pm2_app_name n'est pas en cours d'exécution"
         return 0
     fi
     
-    pm2 stop "$env_name" >/dev/null 2>&1
+    pm2 stop "$pm2_app_name" >/dev/null 2>&1
     pm2 save >/dev/null 2>&1
-    success "Projet $env_name arrêté"
+    success "Projet $pm2_app_name arrêté"
 }
 
 env_remove() {
-    local env_name=$1
-    local project_dir="$PROJECTS_DIR/$env_name"
+    local identifier=$1
+    local project_dir=$(resolve_project_path "$identifier")
+    
+    if [ -z "$project_dir" ]; then
+        warning "Projet $identifier introuvable ou chemin invalide. Impossible de supprimer."
+        return 1
+    fi
+
+    local env_name=$(basename "$project_dir") # Use basename as the PM2 app name
     
     # Stop PM2 process if running
     if pm2 list | grep -q "│ $env_name"; then
-        echo -e "${YELLOW}🛑 Arrêt du processus PM2...${NC}"
+        echo -e "${YELLOW}🛑 Arrêt du processus PM2 $env_name...${NC}"
         pm2 delete "$env_name" >/dev/null 2>&1
         pm2 save >/dev/null 2>&1
     fi
@@ -515,7 +588,7 @@ env_remove() {
         rm -rf "$project_dir"
         success "Projet $env_name supprimé"
     else
-        warning "Répertoire $project_dir introuvable"
+        warning "Répertoire $project_dir introuvable (peut-être déjà supprimé ou chemin incorrect)"
     fi
 }
 

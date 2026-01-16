@@ -27,9 +27,10 @@ show_menu() {
     echo -e "  ${CYAN}5)${NC} 📝 Ouvrir le répertoire de code"
     echo -e "  ${CYAN}6)${NC} 🚀 Déployer un repo GitHub"
     echo -e "  ${CYAN}7)${NC} 🗑️  Supprimer un environnement"
-    echo -e "  ${CYAN}8)${NC} ▶️  Démarrer un environnement"
-    echo -e "  ${CYAN}9)${NC} 🌐 Publier sur le web"
-    echo -e "  ${CYAN}10)${NC} ❌ Quitter"
+    echo -e "  ${CYAN}8)${NC} ▶️  Démarrer un environnement (détecté)"
+    echo -e "  ${CYAN}9)${NC} ▶️  Démarrer un environnement (chemin personnalisé)"
+    echo -e "  ${CYAN}10)${NC} 🌐 Publier sur le web"
+    echo -e "  ${CYAN}11)${NC} ❌ Quitter"
     echo ""
 }
 
@@ -98,7 +99,7 @@ main() {
                     echo ""
                     while IFS= read -r name; do
                         pm2_status=$(get_pm2_status "$name")
-                        project_dir=$(get_project_dir "$name")
+                        project_dir=$(resolve_project_path "$name")
                         
                         # Afficher le statut avec la bonne couleur
                         case "$pm2_status" in
@@ -120,12 +121,13 @@ main() {
                         esac
                         
                         # Afficher le répertoire du projet
-                        if [ -n "$project_dir" ]; then
-                            echo -e "${BLUE}   📂 $project_dir${NC}"
+                        PROJECT_DIR=$(resolve_project_path "$name")
+                        if [ -n "$PROJECT_DIR" ]; then
+                            echo -e "${BLUE}   📂 $PROJECT_DIR${NC}"
                             
                             # Afficher si environnement Flox présent
-                            if [ -d "$project_dir/.flox" ]; then
-                                echo -e "${GREEN}   ✅ Flox activé${NC}"
+                            if [ -d "$PROJECT_DIR/.flox" ]; then
+                            echo -e "${GREEN}   ✅ Flox activé${NC}"
                             fi
                         fi
                         
@@ -162,11 +164,13 @@ main() {
                         echo -e "${BLUE}❌ Annulé${NC}"
                     elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le $((i-1)) ]; then
                         ENV_NAME=$(echo "$ALL_ENVS" | sed -n "${choice}p")
+                        PROJECT_DIR=$(resolve_project_path "$ENV_NAME") # Resolve project dir
+                        PM2_APP_NAME=$(basename "$PROJECT_DIR") # Get the actual PM2 app name
 
                         echo ""
                         echo -e "${GREEN}🌐 URLs pour $ENV_NAME :${NC}"
                         
-                        PORT=$(get_port_from_pm2 "$ENV_NAME")
+                        PORT=$(get_port_from_pm2 "$PM2_APP_NAME")
                         
                         if [ -n "$PORT" ]; then
                             echo -e "  • ${CYAN}http://localhost:${PORT}${NC}"
@@ -231,14 +235,14 @@ main() {
 
                     if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le $((i-1)) ]; then
                         ENV_NAME=$(echo "$ALL_ENVS" | sed -n "${choice}p")
-                        PROJECT_DIR="$PROJECTS_DIR/$ENV_NAME"
+                        PROJECT_DIR=$(resolve_project_path "$ENV_NAME")
 
-                        if [ -d "$PROJECT_DIR" ]; then
-                            echo -e "${GREEN}📂 Répertoire du projet : $PROJECT_DIR${NC}"
-                            echo -e "${GREEN}Ouverture du dossier...${NC}"
-                            cd "$PROJECT_DIR" && exec $SHELL
+                        if [ -z "$PROJECT_DIR" ]; then
+                            echo -e "${RED}❌ Répertoire introuvable : $ENV_NAME${NC}"
                         else
-                            echo -e "${RED}❌ Répertoire introuvable : $PROJECT_DIR${NC}"
+                            echo -e "${GREEN}📂 Répertoire du projet : $PROJECT_DIR${NC}"
+                            echo -e "${GREEN}Ouverture du shell...${NC}"
+                            cd "$PROJECT_DIR" && exec $SHELL
                         fi
                     else
                         echo -e "${RED}❌ Choix invalide${NC}"
@@ -284,8 +288,9 @@ main() {
                     PROJECT_DIR="$PROJECTS_DIR/$PROJECT_NAME"
 
                     # Vérifier si le projet existe déjà
-                    if [ -d "$PROJECT_DIR" ]; then
-                        echo -e "${YELLOW}⚠️  Le projet $PROJECT_NAME existe déjà${NC}"
+                    EXISTING_PROJECT_PATH=$(resolve_project_path "$PROJECT_NAME")
+                    if [ -n "$EXISTING_PROJECT_PATH" ]; then
+                        echo -e "${YELLOW}⚠️  Le projet $PROJECT_NAME existe déjà à $EXISTING_PROJECT_PATH${NC}"
                         echo -e "${YELLOW}Voulez-vous le remplacer ? (o/N) :${NC} \c"
                         read -r confirm
                         if [[ ! "$confirm" =~ ^[oO]$ ]]; then
@@ -369,7 +374,8 @@ main() {
                         echo ""
                         echo -e "${RED}⚠️  ATTENTION : Cette action est irréversible !${NC}"
                         echo -e "${YELLOW}Projet : $ENV_NAME${NC}"
-                        echo -e "${YELLOW}Dossier : $PROJECTS_DIR/$ENV_NAME${NC}"
+                        PROJECT_DIR=$(resolve_project_path "$ENV_NAME")
+                        echo -e "${YELLOW}Dossier : $PROJECT_DIR${NC}"
                         echo ""
 
                         env_remove "$ENV_NAME"
@@ -382,7 +388,7 @@ main() {
                 ;;
 
             8)
-                echo -e "${GREEN}▶️  Démarrer un environnement${NC}"
+                echo -e "${GREEN}▶️  Démarrer un environnement (détecté)${NC}"
                 ALL_ENVS=$(list_all_environments)
 
                 if [ -z "$ALL_ENVS" ]; then
@@ -405,31 +411,30 @@ main() {
                         echo -e "${BLUE}❌ Annulé${NC}"
                     elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le $((i-1)) ]; then
                         ENV_NAME=$(echo "$ALL_ENVS" | sed -n "${choice}p")
+                        
+                        echo -e "${GREEN}▶️  Démarrage du projet $ENV_NAME...${NC}"
 
-                        PROJECT_DIR=$(get_project_dir "$ENV_NAME")
-
-                        if [ -z "$PROJECT_DIR" ]; then
-                            echo -e "${RED}❌ Projet introuvable : $ENV_NAME${NC}"
-                        else
-                            echo ""
-                            echo -e "${GREEN}▶️  Démarrage du projet $ENV_NAME...${NC}"
-
-                            env_start "$ENV_NAME"
-                            
-                            echo ""
-                            echo -e "${GREEN}✅ Projet démarré avec succès !${NC}"
-                            echo ""
-                            
-                            PORT=$(get_port_from_pm2 "$ENV_NAME")
+                        env_start "$ENV_NAME"
+                        
+                        echo ""
+                        echo -e "${GREEN}✅ Projet démarré avec succès !${NC}"
+                        echo ""
+                        
+                        PROJECT_DIR=$(resolve_project_path "$ENV_NAME")
+                        if [ -n "$PROJECT_DIR" ]; then
+                            PORT=$(get_port_from_pm2 "$(basename "$PROJECT_DIR")")
                             if [ -n "$PORT" ]; then
                                 echo -e "${BLUE}🌐 URLs disponibles :${NC}"
                                 echo -e "  • ${CYAN}http://localhost:${PORT}${NC}"
                             else
-                                echo -e "${YELLOW}  ⚠️  Port non assigné${NC}"
+                                echo -e "${YELLOW}  ⚠️  Port non assigné ou non détecté${NC}"
                             fi
                             echo ""
                             echo -e "${YELLOW}📝 Code disponible dans : $PROJECT_DIR${NC}"
+                        else
+                            echo -e "${RED}❌ Impossible de résoudre le répertoire du projet pour $ENV_NAME${NC}"
                         fi
+
                     else
                         echo -e "${RED}❌ Choix invalide${NC}"
                     fi
@@ -437,6 +442,38 @@ main() {
                 ;;
 
             9)
+                echo -e "${GREEN}▶️  Démarrer un environnement (chemin personnalisé)${NC}"
+                echo ""
+                echo -e "${YELLOW}Entrez le chemin absolu du projet (ex: /root/my-robots/chatbot) :${NC} \c"
+                read -r CUSTOM_PATH
+
+                if [ -z "$CUSTOM_PATH" ]; then
+                    echo -e "${RED}❌ Chemin requis${NC}"
+                else
+                    echo -e "${GREEN}▶️  Démarrage du projet à partir de $CUSTOM_PATH...${NC}"
+                    env_start "$CUSTOM_PATH"
+                    echo ""
+                    echo -e "${GREEN}✅ Projet démarré avec succès ou mis à jour !${NC}"
+                    
+                    PROJECT_DIR=$(resolve_project_path "$CUSTOM_PATH")
+                    if [ -n "$PROJECT_DIR" ]; then
+                        ENV_NAME=$(basename "$PROJECT_DIR") # This assumes project name is the last part of the path
+                        PORT=$(get_port_from_pm2 "$ENV_NAME")
+                        if [ -n "$PORT" ]; then
+                            echo -e "${BLUE}🌐 URLs disponibles :${NC}"
+                            echo -e "  • ${CYAN}http://localhost:${PORT}${NC}"
+                        else
+                            echo -e "${YELLOW}  ⚠️  Port non assigné ou non détecté${NC}"
+                        fi
+                        echo ""
+                        echo -e "${YELLOW}📝 Code disponible dans : $PROJECT_DIR${NC}"
+                    else
+                        echo -e "${RED}❌ Impossible de résoudre le répertoire du projet pour $CUSTOM_PATH${NC}"
+                    fi
+                fi
+                ;;
+
+            10)
                 echo -e "${GREEN}🌐 Publier sur le web${NC}"
                 echo ""
                 
@@ -565,7 +602,7 @@ except:
                 echo -e "${YELLOW}⚠️  Note: Le certificat HTTPS peut prendre quelques minutes${NC}"
                 ;;
 
-            10)
+            11)
                 echo -e "${GREEN}👋 Au revoir !${NC}"
                 exit 0
                 ;;
@@ -579,6 +616,7 @@ except:
         read -r
     done
 }
+
 
 # Lancer le menu
 main
